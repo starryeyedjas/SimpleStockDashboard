@@ -2,14 +2,48 @@
 Stock Dashboard
 ---------------
 Run with:  streamlit run stock_dashboard.py
-Requires:  pip install streamlit yfinance pandas plotly
+Requires:  pip install streamlit yfinance pandas plotly requests requests-cache
+
+Note on deployment:
+  Yahoo Finance rate-limits requests from shared cloud IPs (including
+  Streamlit Community Cloud), so data can intermittently come back empty
+  even when the code works locally. This version adds on-disk request
+  caching, retry/backoff, and graceful degradation to minimize that. If
+  you still get throttled on Cloud, switch to a keyed API (Alpha Vantage,
+  Finnhub, Twelve Data) for the deployed build.
 """
+
+import os
+import time
+import tempfile
 
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import date, timedelta
+
+# Point yfinance's tz cache at a writable dir (Cloud lacks ~/.cache).
+_CACHE_DIR = os.path.join(tempfile.gettempdir(), "yf_cache")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+try:
+    yf.set_tz_cache_location(_CACHE_DIR)
+except Exception:
+    pass
+
+# Optional on-disk HTTP cache cuts how often we actually hit Yahoo.
+try:
+    import requests_cache
+    _SESSION = requests_cache.CachedSession(
+        os.path.join(_CACHE_DIR, "http_cache"),
+        expire_after=900,
+    )
+    _SESSION.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+except Exception:
+    _SESSION = None
 
 st.set_page_config(page_title="Stock Dashboard", page_icon="📈", layout="wide")
 
@@ -33,19 +67,47 @@ chart_type = st.sidebar.radio("Chart type", ["Candlestick", "Line"], horizontal=
 show_volume = st.sidebar.checkbox("Show volume", value=True)
 
 # ----------------------------- Data loading -----------------------------
+def _with_retries(fn, attempts=4, base_delay=1.5):
+    """Run fn() with exponential backoff on empty results / rate-limit errors."""
+    last_exc = None
+    for i in range(attempts):
+        try:
+            result = fn()
+            empty = (isinstance(result, pd.DataFrame) and result.empty) or \
+                    (isinstance(result, dict) and not result)
+            if not empty:
+                return result
+        except Exception as e:  # YFRateLimitError, network blips, etc.
+            last_exc = e
+        time.sleep(base_delay * (2 ** i))  # 1.5s, 3s, 6s, 12s
+    if last_exc:
+        raise last_exc
+    return fn()  # final attempt, return whatever we get (possibly empty)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def load_history(symbol: str, days: int) -> pd.DataFrame:
-    start = date.today() - timedelta(days=days + max(ma_options or [0]) + 10)
-    df = yf.download(symbol, start=start, progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
+def load_history(symbol: str, days: int, ma_max: int) -> pd.DataFrame:
+    start = date.today() - timedelta(days=days + ma_max + 10)
+
+    def _fetch():
+        df = yf.download(
+            symbol, start=start, progress=False,
+            auto_adjust=True, session=_SESSION,
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+
+    return _with_retries(_fetch)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_info(symbol: str) -> dict:
+    def _fetch():
+        return yf.Ticker(symbol, session=_SESSION).info or {}
+
     try:
-        return yf.Ticker(symbol).info or {}
+        return _with_retries(_fetch)
     except Exception:
         return {}
 
@@ -54,12 +116,24 @@ if not ticker:
     st.info("Enter a ticker symbol in the sidebar to begin.")
     st.stop()
 
-with st.spinner(f"Loading {ticker}…"):
-    data = load_history(ticker, period_map[period_label])
-    info = load_info(ticker)
+ma_max = max(ma_options or [0])
+try:
+    with st.spinner(f"Loading {ticker}…"):
+        data = load_history(ticker, period_map[period_label], ma_max)
+        info = load_info(ticker)
+except Exception:
+    data, info = pd.DataFrame(), {}
 
 if data.empty:
-    st.error(f"No data found for '{ticker}'. Check the symbol and try again.")
+    st.warning(
+        f"Couldn't load data for **{ticker}** right now. This is usually "
+        "Yahoo Finance rate-limiting the shared server IP, not a problem "
+        "with the symbol. Wait a minute and click **Rerun**, or try a "
+        "different ticker."
+    )
+    if st.button("Rerun"):
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
 # Compute moving averages on full window, then trim to selected range for display

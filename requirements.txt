@@ -1,4 +1,6 @@
-streamlit
-yfinance
-pandas
-plotly
+streamlit>=1.40
+yfinance>=0.2.55
+pandas>=2.0
+plotly>=5.20
+requests>=2.31
+requests-cache>=1.2
